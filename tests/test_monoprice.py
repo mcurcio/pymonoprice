@@ -328,6 +328,42 @@ class TestMonoprice(unittest.TestCase):
             self.monoprice.set_source(3, 3)
 
 
+class TestMonoprice31028(unittest.TestCase):
+    def setUp(self):
+        self.responses = {}
+        port = create_dummy_port(self.responses, terminator=b'+')
+        self.monoprice = get_monoprice(port, model='31028')
+
+    def test_zone_status(self):
+        self.responses[b'?1ZS+'] = b'#1ZS VO20 PO1 MU0 IS3+'
+        self.responses[b'?1BA+'] = b'?1BA031+'
+        status = self.monoprice.zone_status(11)
+        self.assertIsNotNone(status)
+        self.assertEqual(11, status.zone)
+        self.assertTrue(status.power)
+        self.assertFalse(status.mute)
+        self.assertEqual(20, status.volume)
+        self.assertEqual(10, status.balance)
+        self.assertEqual(3, status.source)
+        self.assertEqual(0, len(self.responses))
+
+    def test_all_zone_status(self):
+        for idx in range(1, 7):
+            self.responses[f'?{idx}ZS+'.encode()] = (
+                f'#{idx}ZS VO{10 + idx:02} PO{idx % 2} MU{(idx + 1) % 2} IS{idx}+'
+            ).encode()
+            self.responses[f'?{idx}BA+'.encode()] = f'?{idx}BA{30 + idx:02}+'.encode()
+
+        statuses = self.monoprice.all_zone_status(1)
+        expected_balance = int(round((31 / 63) * 20))
+        self.assertEqual(6, len(statuses))
+        self.assertEqual(11, statuses[0].zone)
+        self.assertEqual(11, statuses[0].volume)
+        self.assertEqual(expected_balance, statuses[0].balance)
+        self.assertEqual(16, statuses[-1].zone)
+        self.assertEqual(0, len(self.responses))
+
+
 class TestAsyncMonoprice(TestMonoprice):
 
     def setUp(self):

@@ -3,13 +3,13 @@ import os
 import pty
 
 
-def create_dummy_port(responses):
+def create_dummy_port(responses, terminator: bytes = b"\r"):
     def listener(port):
         # continuously listen to commands on the master device
         while 1:
             res = b''
-            while not res.endswith(b"\r"):
-                # keep reading one byte at a time until we have a full line
+            while not res.endswith(terminator):
+                # keep reading one byte at a time until we have a full command
                 res += os.read(port, 1)
             print("command: %s" % res)
 

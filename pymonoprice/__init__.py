@@ -6,6 +6,7 @@ import re
 import serial
 from dataclasses import dataclass
 from functools import wraps
+from concurrent.futures import ThreadPoolExecutor
 from serial_asyncio_fast import create_serial_connection, SerialTransport
 from threading import RLock
 from typing import TYPE_CHECKING
@@ -25,6 +26,8 @@ ZONE_PATTERN = re.compile(
 EOL = b"\r\n#"
 LEN_EOL = len(EOL)
 TIMEOUT = 2  # Number of seconds before serial operation timeout
+MODEL_10761 = "10761"
+MODEL_31028 = "31028"
 
 
 def synchronized(
@@ -124,12 +127,7 @@ class Monoprice:
         """
         self._lock = lock
         self._port = serial.serial_for_url(port_url, do_not_open=True)
-        self._port.baudrate = 9600
-        self._port.stopbits = serial.STOPBITS_ONE
-        self._port.bytesize = serial.EIGHTBITS
-        self._port.parity = serial.PARITY_NONE
-        self._port.timeout = TIMEOUT
-        self._port.write_timeout = TIMEOUT
+        _configure_serial_port(self._port)
         self._port.open()
 
     def _send_request(self, request: bytes) -> None:
@@ -275,6 +273,171 @@ class Monoprice:
         self.set_source(status.zone, status.source)
 
 
+PLUS_TERMINATOR = b"+"
+ZONE_STATUS_RE_31028 = re.compile(r"#(?P<zone>\d)ZS\s+VO(?P<volume>\d+)\s+PO(?P<power>\d)\s+MU(?P<mute>\d)\s+IS(?P<input>\d+)")
+BALANCE_RE_31028 = re.compile(r"\?(?P<zone>\d)BA(?P<balance>\d+)")
+
+
+class Monoprice31028:
+    def __init__(self, port_url: str, lock: RLock) -> None:
+        """Monoprice 31028 amplifier interface."""
+
+        self._lock = lock
+        self._port = serial.serial_for_url(port_url, do_not_open=True)
+        _configure_serial_port(self._port)
+        self._port.open()
+
+    def _send_request(self, request: bytes) -> None:
+        _LOGGER.debug('Sending "%s"', request)
+        self._port.reset_output_buffer()
+        self._port.reset_input_buffer()
+        self._port.write(request)
+        self._port.flush()
+
+    def _process_request(self, request: bytes) -> str:
+        self._send_request(request)
+        result = bytearray()
+        while True:
+            c = self._port.read(1)
+            if not c:
+                raise serial.SerialTimeoutException(
+                    "Connection timed out! Last received bytes {}".format(
+                        [hex(a) for a in result]
+                    )
+                )
+            if c == PLUS_TERMINATOR:
+                break
+            result += c
+        ret = bytes(result)
+        _LOGGER.debug('Received "%s"', ret)
+        return ret.decode("ascii")
+
+    @staticmethod
+    def _zone_to_wire(zone: int) -> int:
+        if zone >= 10:
+            zone = zone % 10
+        if zone < 1 or zone > 6:
+            raise ValueError(f"Invalid zone: {zone}")
+        return zone
+
+    @staticmethod
+    def _canonical_zone(zone: int) -> int:
+        return 10 + zone
+
+    @staticmethod
+    def _balance_wire_to_internal(balance: int) -> int:
+        balance = max(0, min(balance, 63))
+        return int(round(balance / 63 * 20))
+
+    @staticmethod
+    def _balance_internal_to_wire(balance: int) -> int:
+        balance = max(0, min(balance, 20))
+        return int(round(balance / 20 * 63))
+
+    @staticmethod
+    def _bool_to_flag(value: bool | int | str | None) -> str:
+        return "1" if bool(value) else "0"
+
+    def _query_zone(self, zone: int) -> tuple[int, int, int, int, int] | None:
+        wire_zone = self._zone_to_wire(zone)
+        response = self._process_request(f"?{wire_zone}ZS+".encode())
+        match = ZONE_STATUS_RE_31028.match(response.strip())
+        if not match:
+            return None
+        return (
+            int(match.group("zone")),
+            int(match.group("volume")),
+            int(match.group("power")),
+            int(match.group("mute")),
+            int(match.group("input")),
+        )
+
+    def _query_balance(self, zone: int) -> int | None:
+        wire_zone = self._zone_to_wire(zone)
+        response = self._process_request(f"?{wire_zone}BA+".encode())
+        match = BALANCE_RE_31028.match(response.strip())
+        if not match:
+            return None
+        return int(match.group("balance"))
+
+    @synchronized
+    def zone_status(self, zone: int) -> ZoneStatus | None:
+        status = self._query_zone(zone)
+        balance = self._query_balance(zone)
+        if not status or balance is None:
+            return None
+
+        _, volume, power, mute, source = status
+        canonical_zone = self._canonical_zone(self._zone_to_wire(zone))
+        return ZoneStatus(
+            canonical_zone,
+            False,
+            bool(power),
+            bool(mute),
+            False,
+            int(max(0, min(volume, 38))),
+            7,
+            7,
+            self._balance_wire_to_internal(balance),
+            source,
+            False,
+        )
+
+    @synchronized
+    def all_zone_status(self, unit: int) -> list[ZoneStatus]:
+        if unit != 1:
+            return []
+        statuses: list[ZoneStatus] = []
+        for zone in range(11, 17):
+            status = self.zone_status(zone)
+            if status:
+                statuses.append(status)
+        return statuses
+
+    def _write_command(self, zone: int, command: str, value: str) -> None:
+        wire_zone = self._zone_to_wire(zone)
+        payload = f"!{wire_zone}{command}{value}+".encode()
+        self._send_request(payload)
+
+    @synchronized
+    def set_power(self, zone: int, power: bool) -> None:
+        self._write_command(zone, "PR", self._bool_to_flag(power))
+
+    @synchronized
+    def set_mute(self, zone: int, mute: bool) -> None:
+        self._write_command(zone, "MU", self._bool_to_flag(mute))
+
+    @synchronized
+    def set_volume(self, zone: int, volume: int) -> None:
+        volume = int(max(0, min(volume, 38)))
+        self._write_command(zone, "VO", f"{volume:02}")
+
+    @synchronized
+    def set_treble(self, zone: int, treble: int) -> None:
+        _LOGGER.warning("Treble is not supported on Monoprice 31028 amplifiers")
+
+    @synchronized
+    def set_bass(self, zone: int, bass: int) -> None:
+        _LOGGER.warning("Bass is not supported on Monoprice 31028 amplifiers")
+
+    @synchronized
+    def set_balance(self, zone: int, balance: int) -> None:
+        wire_balance = self._balance_internal_to_wire(balance)
+        self._write_command(zone, "BA", f"{wire_balance:02}")
+
+    @synchronized
+    def set_source(self, zone: int, source: int) -> None:
+        source = int(max(1, min(source, 6)))
+        self._write_command(zone, "IS", f"{source}")
+
+    @synchronized
+    def restore_zone(self, status: ZoneStatus) -> None:
+        self.set_power(status.zone, status.power)
+        self.set_mute(status.zone, status.mute)
+        self.set_volume(status.zone, status.volume)
+        self.set_balance(status.zone, status.balance)
+        self.set_source(status.zone, status.source)
+
 class MonopriceAsync:
     def __init__(
         self, monoprice_protocol: MonopriceProtocol, lock: asyncio.Lock
@@ -389,6 +552,42 @@ class MonopriceAsync:
         await self._protocol.send(_format_set_source(status.zone, status.source))
 
 
+class MonopriceAsyncProxy:
+    def __init__(self, monoprice: Monoprice31028, loop: asyncio.AbstractEventLoop) -> None:
+        self._monoprice = monoprice
+        self._loop = loop
+        self._executor = ThreadPoolExecutor(max_workers=1)
+
+    async def zone_status(self, zone: int) -> ZoneStatus | None:
+        return await self._loop.run_in_executor(self._executor, self._monoprice.zone_status, zone)
+
+    async def all_zone_status(self, unit: int) -> list[ZoneStatus]:
+        return await self._loop.run_in_executor(self._executor, self._monoprice.all_zone_status, unit)
+
+    async def set_power(self, zone: int, power: bool) -> None:
+        await self._loop.run_in_executor(self._executor, self._monoprice.set_power, zone, power)
+
+    async def set_mute(self, zone: int, mute: bool) -> None:
+        await self._loop.run_in_executor(self._executor, self._monoprice.set_mute, zone, mute)
+
+    async def set_volume(self, zone: int, volume: int) -> None:
+        await self._loop.run_in_executor(self._executor, self._monoprice.set_volume, zone, volume)
+
+    async def set_treble(self, zone: int, treble: int) -> None:
+        await self._loop.run_in_executor(self._executor, self._monoprice.set_treble, zone, treble)
+
+    async def set_bass(self, zone: int, bass: int) -> None:
+        await self._loop.run_in_executor(self._executor, self._monoprice.set_bass, zone, bass)
+
+    async def set_balance(self, zone: int, balance: int) -> None:
+        await self._loop.run_in_executor(self._executor, self._monoprice.set_balance, zone, balance)
+
+    async def set_source(self, zone: int, source: int) -> None:
+        await self._loop.run_in_executor(self._executor, self._monoprice.set_source, zone, source)
+
+    async def restore_zone(self, status: ZoneStatus) -> None:
+        await self._loop.run_in_executor(self._executor, self._monoprice.restore_zone, status)
+
 class MonopriceProtocol(asyncio.Protocol):
     def __init__(self) -> None:
         super().__init__()
@@ -441,6 +640,15 @@ class MonopriceProtocol(asyncio.Protocol):
         return ret.decode("ascii")
 
 # Helpers
+
+
+def _configure_serial_port(port: serial.Serial) -> None:
+    port.baudrate = 9600
+    port.stopbits = serial.STOPBITS_ONE
+    port.bytesize = serial.EIGHTBITS
+    port.parity = serial.PARITY_NONE
+    port.timeout = TIMEOUT
+    port.write_timeout = TIMEOUT
 
 
 def _subsequence_count(sequence: bytearray, sub: bytes, previous: tuple[int, int] | None = None) -> tuple[int, int]:
@@ -496,28 +704,106 @@ def _format_set_source(zone: int, source: int) -> bytes:
     return "<{}CH{:02}\r".format(zone, source).encode()
 
 
-def get_monoprice(port_url: str) -> Monoprice:
-    """
-    Return synchronous version of Monoprice interface
-    :param port_url: serial port, i.e. '/dev/ttyUSB0'
-    :return: synchronous implementation of Monoprice interface
-    """
+def _normalize_model_argument(model: str | None) -> str | None:
+    if model is None:
+        return None
+    normalized = model.strip().lower()
+    if not normalized or normalized == "auto":
+        return None
+    if normalized in (MODEL_10761, MODEL_31028):
+        return normalized
+    raise ValueError(f"Unsupported Monoprice model '{model}'")
 
+
+def _read_serial_response(
+    port: serial.Serial, request: bytes, terminator: bytes, count: int
+) -> bytes:
+    port.reset_output_buffer()
+    port.reset_input_buffer()
+    port.write(request)
+    port.flush()
+    result = bytearray()
+    subseq: tuple[int, int] | None = None
+    while True:
+        c = port.read(1)
+        if not c:
+            raise serial.SerialTimeoutException(
+                "Connection timed out! Last received bytes {}".format(
+                    [hex(a) for a in result]
+                )
+            )
+        result += c
+        subseq = _subsequence_count(result, terminator, subseq)
+        if subseq[1] >= count:
+            break
+    return bytes(result)
+
+
+def _try_detect_10761(port: serial.Serial) -> bool:
+    try:
+        response = _read_serial_response(
+            port, _format_zone_status_request(11), EOL, 2
+        )
+    except serial.SerialTimeoutException:
+        return False
+    decoded = response.decode("ascii", errors="ignore")
+    return ZONE_PATTERN.search(decoded) is not None
+
+
+def _try_detect_31028(port: serial.Serial) -> bool:
+    try:
+        response = _read_serial_response(port, b"?1VO+", PLUS_TERMINATOR, 1)
+    except serial.SerialTimeoutException:
+        return False
+    cleaned = response.decode("ascii", errors="ignore")
+    return "?1VO" in cleaned
+
+
+def _detect_model(port_url: str) -> str:
+    port = serial.serial_for_url(port_url, do_not_open=True)
+    _configure_serial_port(port)
+    port.open()
+    try:
+        if _try_detect_10761(port):
+            return MODEL_10761
+        if _try_detect_31028(port):
+            return MODEL_31028
+    finally:
+        port.close()
+    raise RuntimeError("Unable to detect Monoprice amplifier model")
+
+
+def get_monoprice(port_url: str, model: str | None = None):
+    """Return synchronous Monoprice interface with optional protocol autodetect."""
+
+    normalized = _normalize_model_argument(model)
+    detected = normalized or _detect_model(port_url)
     lock = RLock()
+    if detected == MODEL_10761:
+        return Monoprice(port_url, lock)
+    if detected == MODEL_31028:
+        return Monoprice31028(port_url, lock)
+    raise ValueError(f"Unsupported Monoprice model '{detected}'")
 
-    return Monoprice(port_url, lock)
 
-
-async def get_async_monoprice(port_url: str) -> MonopriceAsync:
-    """
-    Return asynchronous version of Monoprice interface
-    :param port_url: serial port, i.e. '/dev/ttyUSB0'
-    :return: asynchronous implementation of Monoprice interface
-    """
-
-    lock = asyncio.Lock()
+async def get_async_monoprice(port_url: str, model: str | None = None):
+    """Return asynchronous Monoprice interface with optional protocol autodetect."""
 
     loop = asyncio.get_running_loop()
+    normalized = _normalize_model_argument(model)
+    detected = (
+        normalized
+        if normalized
+        else await loop.run_in_executor(None, _detect_model, port_url)
+    )
+
+    if detected == MODEL_31028:
+        monoprice = await loop.run_in_executor(
+            None, lambda: Monoprice31028(port_url, RLock())
+        )
+        return MonopriceAsyncProxy(monoprice, loop)
+
+    lock = asyncio.Lock()
     _, protocol = await create_serial_connection(
         loop, MonopriceProtocol, port_url, baudrate=9600
     )
